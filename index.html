@@ -1286,11 +1286,19 @@
         PHOTO_DB = "map-notes-photos",
         PHOTO_STORE = "photos",
         PHOTO_GC_AGE_MS = 24 * 3600 * 1000,
+        THUMB_PX = 200, // миниатюры (список, подсказки, окно заметки): 200×200 через преобразование изображений Supabase
         IDB_PREFIX = "idb:",
         CDN = "https://cdn.jsdelivr.net/npm",
         MAPLIBRE_VER = "4.7.1",
         DEFAULT_PIN = "#1a73e8",
         BAD_COLOR = "#d93025";
+      // База по умолчанию: заметки в таблице notes, фото файлами в хранилище photos.
+      // Публичный ключ (publishable) предназначен для браузера; другую базу можно указать в меню «База сайта».
+      const DEFAULT_DB = {
+        url: "https://pdpiopaacfggxnctimdi.supabase.co",
+        key: "sb_publishable_2mrYjRGrVNfiswKdblLWlA_le-8aZMj",
+      };
+      const SHARED_PROFILE = "Общая база";
       const STYLES = {
         liberty: "https://tiles.openfreemap.org/styles/liberty",
         bright: "https://tiles.openfreemap.org/styles/bright",
@@ -1544,6 +1552,42 @@
       function photoSrc(ref) {
         return isIdbRef(ref) ? photoUrls.get(ref.slice(IDB_PREFIX.length)) || "" : ref || "";
       }
+      // Миниатюра фото из хранилища Supabase (несколько КБ вместо ~150 КБ). Если преобразование
+      // изображений недоступно, картинка сама переключится на полное фото (см. обработчик ошибок ниже).
+      const OBJ_PUBLIC = "/storage/v1/object/public/";
+      let thumbsOff = false;
+      try {
+        thumbsOff = sessionStorage.getItem("mn-thumbs-off") === "1";
+      } catch (e) {}
+      function thumbSrc(ref) {
+        const src = photoSrc(ref);
+        if (thumbsOff || !src.includes(OBJ_PUBLIC) || !/\.supabase\.co\//.test(src)) return src;
+        return (
+          src.replace(OBJ_PUBLIC, "/storage/v1/render/image/public/") +
+          `?width=${THUMB_PX}&height=${THUMB_PX}&resize=cover&quality=70`
+        );
+      }
+      // <img> миниатюры с запасным полным фото в data-full
+      function thumbImg(ref, attrs = "") {
+        const full = photoSrc(ref);
+        if (!full) return "";
+        return `<img src="${escapeHtml(thumbSrc(ref))}" data-full="${escapeHtml(full)}" ${attrs} />`;
+      }
+      document.addEventListener(
+        "error",
+        (e) => {
+          const im = e.target;
+          if (!(im instanceof HTMLImageElement) || !im.dataset.full || im.src === im.dataset.full) return;
+          if (im.src.includes("/render/image/")) {
+            thumbsOff = true;
+            try {
+              sessionStorage.setItem("mn-thumbs-off", "1");
+            } catch (_) {}
+          }
+          im.src = im.dataset.full;
+        },
+        true,
+      );
       function blobToDataUrl(blob) {
         return new Promise((resolve, reject) => {
           const r = new FileReader();
@@ -1981,7 +2025,7 @@
           draftPhotos
             .map(
               (ref, i) =>
-                `<div class="photo-item"><img src="${escapeHtml(photoSrc(ref))}" alt="Фото ${i + 1}" data-open="${i}" /><button type="button" data-del="${i}" aria-label="Удалить фото ${i + 1}">${ICON_X}</button><button type="button" data-save="${i}" class="photo-save" aria-label="Сохранить фото ${i + 1} в галерею">↓</button></div>`,
+                `<div class="photo-item">${thumbImg(ref, `alt="Фото ${i + 1}" data-open="${i}"`)}<button type="button" data-del="${i}" aria-label="Удалить фото ${i + 1}">${ICON_X}</button><button type="button" data-save="${i}" class="photo-save" aria-label="Сохранить фото ${i + 1} в галерею">↓</button></div>`,
             )
             .join("") + add;
       }
@@ -1993,7 +2037,7 @@
         else if (t.dataset.del != null) {
           draftPhotos.splice(Number(t.dataset.del), 1);
           renderPhotos();
-        } else if (t.dataset.open != null) openLightbox(t.src);
+        } else if (t.dataset.open != null) openLightbox(t.dataset.full || t.src);
         else if (t.dataset.save != null) {
           if (await saveToGallery(draftPhotos[Number(t.dataset.save)])) toast("Сохранено в галерею / Файлы");
         }
@@ -2368,9 +2412,7 @@
           .map((n) => {
             const thumbs = (n.photos || [])
               .slice(0, 3)
-              .map(photoSrc)
-              .filter(Boolean)
-              .map((src) => `<img src="${escapeHtml(src)}" alt="" loading="lazy" decoding="async" />`)
+              .map((ref) => thumbImg(ref, 'alt="" loading="lazy" decoding="async"'))
               .join("");
             const tags = AUDIT.filter((a) => (n.criteria || {})[a.id])
               .map((a) => {
@@ -2575,9 +2617,7 @@
       function popupHtml(note) {
         const imgs = (note.photos || [])
           .slice(0, 3)
-          .map(photoSrc)
-          .filter(Boolean)
-          .map((src) => `<img class="popup-img" src="${escapeHtml(src)}" alt="" />`)
+          .map((ref) => thumbImg(ref, 'class="popup-img" alt=""'))
           .join("");
         return `<strong>${escapeHtml(note.title || "Заметка")}</strong><br>${escapeHtml(note.text || "")}<div>${imgs}</div>`;
       }
@@ -3200,6 +3240,14 @@
           target.notes = mergeNotesInto(target.notes, u.notes, counts);
         });
         if (!state.currentUserId && state.users[0]) state.currentUserId = state.users[0].id;
+        // как в первой версии: если текущий профиль пуст (например, только что созданная «Общая база»),
+        // после импорта сразу открываем импортированный профиль с заметками
+        const cur = state.users.find((x) => x.id === state.currentUserId);
+        if (!cur || !(cur.notes || []).length) {
+          const firstName = String((data.users.find((u) => (u.notes || []).length) || {}).name || "").trim();
+          const target = state.users.find((x) => (x.name || "").trim() === firstName && (x.notes || []).length);
+          if (target) state.currentUserId = target.id;
+        }
         saveApp(state);
         return counts;
       }
@@ -3263,9 +3311,12 @@
       }
 
       // ===== База сайта (Supabase) =====
+      // Пока в «Базе сайта» ничего не сохранено, используется база по умолчанию.
       function loadDb() {
+        const raw = storeGet(DB_KEY);
+        if (raw == null) return { ...DEFAULT_DB };
         try {
-          return JSON.parse(storeGet(DB_KEY) || "{}");
+          return JSON.parse(raw) || {};
         } catch {
           return {};
         }
@@ -3278,10 +3329,11 @@
         return !!(c.url && c.key);
       }
       const dbBase = (cfg) => cfg.url.replace(/\/$/, "");
+      const keyHeaders = (key) =>
+        /^eyJ/.test(key) ? { apikey: key, Authorization: `Bearer ${key}` } : { apikey: key };
       function dbHeaders(cfg) {
         return {
-          apikey: cfg.key,
-          Authorization: `Bearer ${cfg.key}`,
+          ...keyHeaders(cfg.key),
           "Content-Type": "application/json",
           Prefer: "resolution=merge-duplicates",
         };
@@ -3315,17 +3367,16 @@
       async function uploadPhoto(blob) {
         const cfg = loadDb();
         if (!cfg.url || !cfg.key) throw new Error("no db");
-        const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.jpg`;
+        const name = `notes/${uid()}.jpg`;
         const base = dbBase(cfg);
         const res = await dbFetch(
           `${base}/storage/v1/object/photos/${name}`,
           {
             method: "POST",
             headers: {
-              Authorization: `Bearer ${cfg.key}`,
-              apikey: cfg.key,
-              "Content-Type": "image/jpeg",
-              "x-upsert": "true",
+              ...keyHeaders(cfg.key),
+              "Content-Type": blob.type || "image/jpeg",
+              "cache-control": "max-age=31536000",
             },
             body: blob,
           },
@@ -3338,29 +3389,28 @@
         const cfg = loadDb();
         if (!cfg.url || !cfg.key || !note) return;
         const user = currentUser();
-        // Фото с устройства пробуем загрузить в хранилище базы; не вышло — отправляем base64, как раньше.
+        // В таблицу попадают только ссылки на файлы в хранилище photos, никогда base64.
+        // Если фото не загрузилось, заметка не отправляется: она останется на устройстве
+        // и уйдёт в базу при следующей синхронизации (pushPendingNotes).
         const photos = [];
         let uploaded = false;
         for (const p of note.photos || []) {
-          if (!isIdbRef(p)) {
+          if (typeof p === "string" && p.startsWith("http")) {
             photos.push(p);
             continue;
           }
           const blob = await photoBlob(p);
           if (!blob) continue;
-          try {
-            photos.push(await uploadPhoto(blob));
-            uploaded = true;
-          } catch (e) {
-            photos.push(await blobToDataUrl(blob));
-          }
+          photos.push(await uploadPhoto(blob)); // ошибка прерывает сохранение заметки целиком
+          uploaded = true;
         }
-        if (uploaded) {
+        if (uploaded || photos.length !== (note.photos || []).length) {
           // запоминаем ссылки базы у локальной заметки, чтобы не загружать фото повторно
+          // (и убираем ссылки на фото, которых на устройстве уже нет)
           const notes = loadNotes();
           const i = notes.findIndex((n) => n.id === note.id && n.updatedAt === note.updatedAt);
           if (i >= 0) {
-            notes[i] = { ...notes[i], photos: photos.map((p, k) => (p.startsWith("http") ? p : notes[i].photos[k])) };
+            notes[i] = { ...notes[i], photos };
             saveNotes(notes);
           }
         }
@@ -3573,11 +3623,23 @@
           }
         }
       }
+      // Заметки, чьи фото ещё лежат только на устройстве (не было сети или база не ответила).
+      async function pushPendingNotes() {
+        const pending = loadNotes().filter((n) => (n.photos || []).some((p) => !String(p).startsWith("http")));
+        for (const n of pending) {
+          try {
+            await saveNoteToDb(n);
+          } catch (e) {
+            break; // база недоступна — попробуем в следующий раз
+          }
+        }
+      }
       async function autoSync() {
         if (document.hidden || !navigator.onLine || loadNotesFromDb.busy) return;
         if (!dbConfigured() || !currentUser()) return;
         if (!isHidden(els.modal)) return;
         try {
+          await pushPendingNotes();
           await loadNotesFromDb({ silent: true, since: lastSyncAt || "" });
         } catch (e) {}
       }
@@ -4196,8 +4258,17 @@
       (async () => {
         await migrateInlinePhotos(); // старые base64-фото переезжают из localStorage в IndexedDB
         await ensurePhotoUrls();
+        // Первый запуск: чтобы заметки из базы были видны сразу, создаём профиль «Общая база».
+        if (!currentUser() && dbConfigured()) {
+          const state = loadApp();
+          const user = { id: uid(), name: SHARED_PROFILE, role: "", createdAt: Date.now(), notes: [] };
+          state.users.push(user);
+          state.currentUserId = user.id;
+          saveApp(state);
+        }
         refreshAll();
         gcPhotos();
+        if (dbConfigured() && currentUser() && !loadNotes().length) await loadNotesFromDb();
       })();
       setInterval(autoSync, AUTOSYNC_MS);
       document.addEventListener("visibilitychange", () => {
