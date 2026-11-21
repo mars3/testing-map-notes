@@ -437,8 +437,6 @@
         padding: 14px;
         margin-bottom: 8px;
         cursor: pointer;
-        content-visibility: auto;
-        contain-intrinsic-size: auto 110px;
       }
       .note-card:active {
         background: var(--soft);
@@ -750,6 +748,14 @@
         object-fit: cover;
         border-radius: 8px;
         margin: 4px 4px 0 0;
+      }
+      img.img-broken {
+        background: var(--soft)
+          url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2398a2b3' stroke-width='1.6'%3E%3Crect x='3' y='5' width='18' height='14' rx='3'/%3E%3Ccircle cx='9' cy='11' r='1.6'/%3E%3Cpath d='M21 16l-5-5-9 8'/%3E%3C/svg%3E")
+          center / 40% no-repeat;
+      }
+      .list-more {
+        height: 1px;
       }
       .lightbox:focus {
         outline: none;
@@ -1286,7 +1292,9 @@
         PHOTO_DB = "map-notes-photos",
         PHOTO_STORE = "photos",
         PHOTO_GC_AGE_MS = 24 * 3600 * 1000,
-        THUMB_PX = 200, // миниатюры (список, подсказки, окно заметки): 200×200 через преобразование изображений Supabase
+        USE_THUMBS = false, // миниатюры через преобразование изображений Supabase (платно на Pro); выключено — грузятся полные фото
+        THUMB_PX = 200,
+        LIST_PAGE = 60, // карточек списка за раз; следующая порция — при прокрутке
         IDB_PREFIX = "idb:",
         CDN = "https://cdn.jsdelivr.net/npm",
         MAPLIBRE_VER = "4.7.1",
@@ -1524,10 +1532,17 @@
         if (!idbPromise) {
           idbPromise = new Promise((resolve, reject) => {
             if (!window.indexedDB) return reject(new Error("no indexedDB"));
+            const timer = setTimeout(() => reject(new Error("indexedDB timeout")), 4000);
             const req = indexedDB.open(PHOTO_DB, 1);
             req.onupgradeneeded = () => req.result.createObjectStore(PHOTO_STORE);
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+              clearTimeout(timer);
+              resolve(req.result);
+            };
+            req.onerror = () => {
+              clearTimeout(timer);
+              reject(req.error);
+            };
           }).catch((e) => {
             idbPromise = null;
             throw e;
@@ -1561,7 +1576,7 @@
       } catch (e) {}
       function thumbSrc(ref) {
         const src = photoSrc(ref);
-        if (thumbsOff || !src.includes(OBJ_PUBLIC) || !/\.supabase\.co\//.test(src)) return src;
+        if (!USE_THUMBS || thumbsOff || !src.includes(OBJ_PUBLIC) || !/\.supabase\.co\//.test(src)) return src;
         return (
           src.replace(OBJ_PUBLIC, "/storage/v1/render/image/public/") +
           `?width=${THUMB_PX}&height=${THUMB_PX}&resize=cover&quality=70`
@@ -1577,14 +1592,27 @@
         "error",
         (e) => {
           const im = e.target;
-          if (!(im instanceof HTMLImageElement) || !im.dataset.full || im.src === im.dataset.full) return;
-          if (im.src.includes("/render/image/")) {
+          if (!(im instanceof HTMLImageElement)) return;
+          if (im.dataset.full && im.src.includes("/render/image/")) {
             thumbsOff = true;
             try {
               sessionStorage.setItem("mn-thumbs-off", "1");
             } catch (_) {}
+            im.src = im.dataset.full;
+            return;
           }
-          im.src = im.dataset.full;
+          if (!/^https?:/.test(im.src)) return;
+          if (!im.dataset.retry) {
+            // один повтор: на мобильной сети запрос иногда обрывается
+            im.dataset.retry = "1";
+            const src = im.src;
+            setTimeout(() => {
+              im.src = src + (src.includes("?") ? "&" : "?") + "r=" + Date.now();
+            }, 1500);
+          } else {
+            im.classList.add("img-broken");
+            im.removeAttribute("src");
+          }
         },
         true,
       );
@@ -2408,7 +2436,34 @@
           els.notesList.innerHTML = `<div class="empty">Ничего не найдено по запросу «${escapeHtml(q)}».</div>`;
           return;
         }
-        els.notesList.innerHTML = notes
+        listState = { notes, shown: 0 };
+        els.notesList.innerHTML = "";
+        appendListPage();
+      }
+      // Список выводится порциями по LIST_PAGE карточек: на телефоне 1500 карточек сразу — это медленно.
+      let listState = { notes: [], shown: 0 };
+      const listSentinel = document.createElement("div");
+      listSentinel.className = "list-more";
+      const listObserver =
+        "IntersectionObserver" in window
+          ? new IntersectionObserver((entries) => entries.some((e) => e.isIntersecting) && appendListPage(), {
+              root: els.notesList,
+              rootMargin: "400px",
+            })
+          : null;
+      function appendListPage() {
+        const { notes, shown } = listState;
+        const next = notes.slice(shown, shown + (listObserver ? LIST_PAGE : notes.length));
+        listState.shown += next.length;
+        listSentinel.remove();
+        els.notesList.insertAdjacentHTML("beforeend", noteCardsHtml(next));
+        if (listState.shown < notes.length && listObserver) {
+          els.notesList.appendChild(listSentinel);
+          listObserver.observe(listSentinel);
+        }
+      }
+      function noteCardsHtml(notes) {
+        return notes
           .map((n) => {
             const thumbs = (n.photos || [])
               .slice(0, 3)
@@ -3305,9 +3360,10 @@
       };
       // После импорта/синхронизации: base64 → IndexedDB, подгрузка ссылок, перерисовка.
       async function afterPhotosChanged() {
-        await migrateInlinePhotos();
-        await ensurePhotoUrls();
-        refreshAll();
+        refreshAll(); // экран обновляем сразу, не дожидаясь IndexedDB
+        try {
+          if ((await migrateInlinePhotos()) | (await ensurePhotoUrls())) refreshAll();
+        } catch (e) {}
       }
 
       // ===== База сайта (Supabase) =====
@@ -4255,20 +4311,23 @@
         toast("Карта не загрузилась. Проверьте интернет и обновите страницу");
       }
       renderUserUI();
+      // Первый запуск: чтобы заметки из базы были видны сразу, создаём профиль «Общая база».
+      if (!currentUser() && dbConfigured()) {
+        const state = loadApp();
+        const user = { id: uid(), name: SHARED_PROFILE, role: "", createdAt: Date.now(), notes: [] };
+        state.users.push(user);
+        state.currentUserId = user.id;
+        saveApp(state);
+      }
+      refreshAll();
+      if (dbConfigured() && currentUser() && !loadNotes().length) loadNotesFromDb();
+      // фото с устройства (IndexedDB) подгружаются отдельно и ничего не блокируют
       (async () => {
-        await migrateInlinePhotos(); // старые base64-фото переезжают из localStorage в IndexedDB
-        await ensurePhotoUrls();
-        // Первый запуск: чтобы заметки из базы были видны сразу, создаём профиль «Общая база».
-        if (!currentUser() && dbConfigured()) {
-          const state = loadApp();
-          const user = { id: uid(), name: SHARED_PROFILE, role: "", createdAt: Date.now(), notes: [] };
-          state.users.push(user);
-          state.currentUserId = user.id;
-          saveApp(state);
-        }
-        refreshAll();
-        gcPhotos();
-        if (dbConfigured() && currentUser() && !loadNotes().length) await loadNotesFromDb();
+        try {
+          await migrateInlinePhotos(); // старые base64-фото переезжают из localStorage в IndexedDB
+          if (await ensurePhotoUrls()) refreshAll();
+          gcPhotos();
+        } catch (e) {}
       })();
       setInterval(autoSync, AUTOSYNC_MS);
       document.addEventListener("visibilitychange", () => {
