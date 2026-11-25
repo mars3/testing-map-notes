@@ -415,6 +415,32 @@
       .notes-search {
         padding: 12px;
       }
+      .list-filters {
+        display: flex;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .filter-chip {
+        border: 1px solid var(--border);
+        background: var(--solid);
+        color: var(--text);
+        border-radius: 999px;
+        padding: 7px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .filter-chip.on {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--on-accent);
+        font-weight: 600;
+      }
+      .filter-count {
+        opacity: 0.75;
+      }
       .notes-search input {
         margin: 0;
         background: var(--soft);
@@ -1140,6 +1166,11 @@
           autocomplete="off"
           aria-label="Поиск по заметкам"
         />
+        <div class="list-filters">
+          <button id="btnNoTitle" class="filter-chip" type="button" aria-pressed="false">
+            Без названия <span id="noTitleCount" class="filter-count"></span>
+          </button>
+        </div>
       </div>
       <div id="notesList" class="notes-list"></div>
     </aside>
@@ -2422,8 +2453,12 @@
         const all = loadNotes()
           .slice()
           .sort((a, b) => b.updatedAt - a.updatedAt);
-        const notes = q ? all.filter((n) => noteHaystack(n).includes(q)) : all;
-        els.notesCount.textContent = `(${notes.length}${q ? ` из ${all.length}` : ""})`;
+        // фильтр «Без названия»: только заметки с пустым заголовком
+        const untitled = all.filter((n) => !String(n.title || "").trim());
+        $("noTitleCount").textContent = untitled.length;
+        const base = filterNoTitle ? untitled : all;
+        const notes = q ? base.filter((n) => noteHaystack(n).includes(q)) : base;
+        els.notesCount.textContent = `(${notes.length}${q || filterNoTitle ? ` из ${all.length}` : ""})`;
         if (!currentUser()) {
           els.notesList.innerHTML = `<div class="empty">Создайте пользователя в меню слева.</div>`;
           return;
@@ -2433,7 +2468,9 @@
           return;
         }
         if (!notes.length) {
-          els.notesList.innerHTML = `<div class="empty">Ничего не найдено по запросу «${escapeHtml(q)}».</div>`;
+          els.notesList.innerHTML = q
+            ? `<div class="empty">Ничего не найдено по запросу «${escapeHtml(q)}»${filterNoTitle ? " среди заметок без названия" : ""}.</div>`
+            : `<div class="empty">Заметок без названия нет.</div>`;
           return;
         }
         listState = { notes, shown: 0 };
@@ -2475,7 +2512,7 @@
                 return `<span class="${v === "bad" ? "bad" : ""}">${escapeHtml(a.label)}: ${escapeHtml(AUDIT_MARK[v] || v)}</span>`;
               })
               .join("");
-            return `<button class="note-card" data-id="${escapeHtml(n.id)}" type="button">${catBadge(n)}<h3>${escapeHtml(n.title || "Без названия")}</h3><p>${escapeHtml(n.text || "")}</p>${tags ? `<div class="note-tags">${tags}</div>` : ""}${thumbs ? `<div class="note-thumbs">${thumbs}</div>` : ""}<time>${fmtDate(n.updatedAt)}</time></button>`;
+            return `<button class="note-card" data-id="${escapeHtml(n.id)}" type="button">${catBadge(n)}<h3>${escapeHtml(String(n.title || "").trim() || "Без названия")}</h3><p>${escapeHtml(n.text || "")}</p>${tags ? `<div class="note-tags">${tags}</div>` : ""}${thumbs ? `<div class="note-thumbs">${thumbs}</div>` : ""}<time>${fmtDate(n.updatedAt)}</time></button>`;
           })
           .join("");
       }
@@ -2495,6 +2532,18 @@
           st = setTimeout(renderList, 150);
         });
         els.noteSearch.addEventListener("search", renderList);
+      }
+      // Кнопка-фильтр «Без названия»: включает и выключает показ только заметок без заголовка.
+      let filterNoTitle = false;
+      {
+        const btn = $("btnNoTitle");
+        btn.addEventListener("click", () => {
+          filterNoTitle = !filterNoTitle;
+          btn.classList.toggle("on", filterNoTitle);
+          btn.setAttribute("aria-pressed", String(filterNoTitle));
+          renderList();
+          els.notesList.scrollTop = 0;
+        });
       }
       // Одна точка обновления всего интерфейса после изменения данных.
       function refreshAll() {
